@@ -12,7 +12,7 @@ struct ComposeView: View {
             let binding = Binding<Draft>(get: { store.draft ?? d }, set: { store.draft = $0 })
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
-                    Text(d.inReplyTo != nil ? "reply" : "new message")
+                    Text(store.prepared(d.id) != nil ? "draft from claude" : d.inReplyTo != nil ? "reply" : "new message")
                         .font(.system(size: 17, weight: .semibold, design: .rounded))
                     Spacer()
                     if store.accounts.count > 1 {
@@ -29,7 +29,7 @@ struct ComposeView: View {
                     } else {
                         Text("from \(store.account(d.account)?.email ?? "")").font(.system(size: 12)).opacity(0.6)
                     }
-                    Button { withAnimation(.smooth) { store.draft = nil } } label: {
+                    Button { store.closeDraft() } label: {
                         Image(systemName: "xmark").font(.system(size: 12, weight: .semibold)).frame(width: 26, height: 26)
                     }
                     .buttonStyle(.plain).opacity(0.7).keyboardShortcut(.cancelAction)

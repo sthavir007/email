@@ -245,7 +245,34 @@ final class IMAPClient {
             let parts = String(decoding: line, as: UTF8.self).split(separator: " ")
             if parts.first?.uppercased() == "SEARCH" { uids = parts.dropFirst().compactMap { UInt32($0) } }
         }
-        let chosen = uids.suffix(limit)
+        return try fetch(uids: uids, limit: limit)
+    }
+
+    /// Whole-mailbox search. Gmail takes its own search syntax (from:, has:attachment, newer_than:7d …).
+    func search(_ box: String, query: String, gmail: Bool, limit: Int) throws -> [FetchedHeader] {
+        try select(box, force: true)
+        let key = gmail ? "X-GM-RAW" : "TEXT"
+        let lines = query.allSatisfy(\.isASCII)
+            ? try command("UID SEARCH \(key) \(imapQuote(query))")
+            : try command("UID SEARCH CHARSET UTF-8 \(key)", literal: Array(query.utf8))
+        var uids = [UInt32]()
+        for line in lines {
+            let parts = String(decoding: line, as: UTF8.self).split(separator: " ")
+            if parts.first?.uppercased() == "SEARCH" { uids = parts.dropFirst().compactMap { UInt32($0) } }
+        }
+        return try fetch(uids: uids, limit: limit)
+    }
+
+    /// A quick "are you still there" so a dead connection is noticed in seconds, not after a long timeout.
+    func noop(timeout: TimeInterval) throws {
+        let old = sock.timeout
+        sock.timeout = timeout
+        defer { sock.timeout = old }
+        try command("NOOP")
+    }
+
+    private func fetch(uids: [UInt32], limit: Int) throws -> [FetchedHeader] {
+        let chosen = uids.sorted().suffix(limit)
         guard !chosen.isEmpty else { return [] }
         let set = chosen.map(String.init).joined(separator: ",")
         return parseFetch(try command("UID FETCH \(set) (UID FLAGS INTERNALDATE RFC822.SIZE \(Self.headerFields))"))

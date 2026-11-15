@@ -74,10 +74,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         monitors.append(NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
             MainActor.assumeIsolated { self.key(e) ? nil : e }
         }!)
+        // writing to a claude process that has gone away must be an error, not a crash
+        signal(SIGPIPE, SIG_IGN)
+        MailTools.server.start()
+        ChatLibrary.shared.refresh()
+        // test aid: EMAIL_DEMO=1 EMAIL_ASK="…" opens claude and asks it straight away
+        if let ask = ProcessInfo.processInfo.environment["EMAIL_ASK"], ProcessInfo.processInfo.environment["EMAIL_DEMO"] != nil {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(2))
+                MailStore.shared.showClaude = true
+                // "a||b" sends b while a is still being answered, to exercise the queue
+                for part in ask.components(separatedBy: "||") { ClaudeChat.shared.send(part, mail: nil, rendered: nil) }
+            }
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         Task { @MainActor in
+            ClaudeChat.shared.shutdown()
             await MailStore.shared.flushPending()
             NSApp.reply(toApplicationShouldTerminate: true)
         }
@@ -104,6 +118,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor private func scroll(_ e: NSEvent) -> Bool {
         let store = MailStore.shared
         guard let w = e.window, !isChat(w), e.hasPreciseScrollingDeltas, store.draft == nil else { return false }
+        // scrolling inside the claude panel is just scrolling, never a swipe on the mail underneath
+        if store.showClaude, let h = w.contentView?.bounds.height,
+           store.chatFrame.contains(CGPoint(x: e.locationInWindow.x, y: h - e.locationInWindow.y)) {
+            mode = nil
+            return false
+        }
         if e.momentumPhase != [] { return false }
         switch e.phase {
         case .began, .mayBegin:
@@ -160,6 +180,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor private func key(_ e: NSEvent) -> Bool {
         let store = MailStore.shared
         guard let w = e.window, !isChat(w), w.attachedSheet == nil else { return false }
+        // ⇧↩ in claude's box starts a new line (plain ↩ sends)
+        if (e.keyCode == 36 || e.keyCode == 76), e.modifierFlags.contains(.shift), store.showClaude, store.draft == nil,
+           let tv = w.firstResponder as? NSTextView, tv.isEditable, let h = w.contentView?.bounds.height {
+            let r = tv.convert(tv.bounds, to: nil)
+            if store.chatFrame.contains(CGPoint(x: r.midX, y: h - r.midY)) {
+                tv.insertNewlineIgnoringFieldEditor(nil)
+                return true
+            }
+        }
         // ⌘↩ sends from anywhere in the composer, even while typing in the body
         if store.draft != nil {
             if (e.keyCode == 36 || e.keyCode == 76), e.modifierFlags.contains(.command) { store.send(); return true }
@@ -178,6 +207,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return store.selectedID != nil
         }
+        // while claude is open, stray keys must never archive or delete the email behind it
+        if store.showClaude { return false }
         if !e.modifierFlags.intersection([.command, .control, .option]).isEmpty { return false }
         var inWeb = false
         var v = w.firstResponder as? NSView
@@ -186,6 +217,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case 125 where !inWeb: store.step(1); return true
         case 126 where !inWeb: store.step(-1); return true
         default: break
+        }
+        // backspace / forward-delete trash the open email (outside web views, where they edit text)
+        if (e.keyCode == 51 || e.keyCode == 117) && !inWeb {
+            guard let m = store.selected else { return false }
+            store.trash(m)
+            return true
         }
         guard let c = e.charactersIgnoringModifiers else { return false }
         let m = store.selected

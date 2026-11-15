@@ -85,6 +85,22 @@ struct ContentView: View {
                 .environment(\.glassUnderlay, pal.panel ?? (pal.isLight ? Color(red: 0.094, green: 0.169, blue: 0.286).opacity(0.78) : .clear))
                 .environment(\.glassTint, pal.isLight ? Color(red: 0.094, green: 0.169, blue: 0.286).opacity(0.94) : Color.black.opacity(0.55))
             }
+            VStack(alignment: .trailing, spacing: 12) {
+                if store.showClaude {
+                    ChatView()
+                        .frame(maxHeight: .infinity, alignment: .bottom)
+                        .transition(.scale(scale: 0.85, anchor: .bottomTrailing).combined(with: .opacity))
+                } else {
+                    Spacer()
+                }
+                ClaudeButton { store.toggleClaude() }
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(.horizontal, 24).padding(.bottom, 24).padding(.top, 14)
+            if store.draft != nil {
+                Color.black.opacity(0.25).ignoresSafeArea().onTapGesture {}
+                ComposeView().transition(.scale(scale: 0.96).combined(with: .opacity))
+            }
             if let t = store.toast {
                 VStack {
                     Spacer()
@@ -110,20 +126,6 @@ struct ContentView: View {
                 .id(t.id)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            if store.draft != nil {
-                Color.black.opacity(0.25).ignoresSafeArea().onTapGesture {}
-                ComposeView().transition(.scale(scale: 0.96).combined(with: .opacity))
-            }
-            VStack(alignment: .trailing, spacing: 12) {
-                Spacer()
-                if store.showClaude {
-                    ChatView()
-                        .transition(.scale(scale: 0.85, anchor: .bottomTrailing).combined(with: .opacity))
-                }
-                ClaudeButton { store.toggleClaude() }
-            }
-            .frame(maxWidth: .infinity, alignment: .trailing)
-            .padding(24)
         }
         .foregroundStyle(.white)
         .animation(.smooth(duration: 0.3), value: store.draft != nil)
@@ -663,7 +665,7 @@ extension MessageView {
             ToolButton(mail.flagged ? "star.fill" : "star", "star (s)") { store.toggleStar(mail) }
             ToolButton(mail.seen ? "envelope.badge" : "envelope.open", mail.seen ? "mark unread (u)" : "mark read (u)") { store.setSeen(mail, !mail.seen) }
             if store.canArchive(mail) { ToolButton("archivebox", "archive (e)") { store.archive(mail) } }
-            ToolButton("trash", "trash (#)") { store.trash(mail) }
+            ToolButton("trash", "trash (⌫)") { store.trash(mail) }
         }
         .foregroundStyle(.white)
         .environment(\.toolOnDark, true)
@@ -769,6 +771,10 @@ struct MailWebView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.defaultWebpagePreferences.allowsContentJavaScript = false
+        // images that can't load (blocked or dead hosts) disappear instead of showing a "?" box;
+        // this is the app's own script, the email's scripts stay off
+        let hideBroken = "document.addEventListener('error', function (e) { var t = e.target; if (t && t.tagName === 'IMG') { t.style.visibility = 'hidden'; } }, true);"
+        config.userContentController.addUserScript(WKUserScript(source: hideBroken, injectionTime: .atDocumentStart, forMainFrameOnly: true, in: .defaultClient))
         let v = WKWebView(frame: .zero, configuration: config)
         v.navigationDelegate = context.coordinator
         v.setValue(false, forKey: "drawsBackground")

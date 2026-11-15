@@ -36,6 +36,7 @@ struct Rendered {
 enum UndoItem {
     case moves([String])
     case send(UUID)
+    case closed(Draft)
 }
 
 struct Toast: Equatable {
@@ -52,14 +53,14 @@ struct PendingMove {
     let task: Task<Void, Never>
 }
 
-struct DraftFile: Identifiable, Hashable {
-    let id = UUID()
+struct DraftFile: Identifiable, Hashable, Codable {
+    var id = UUID()
     var name: String
     var data: Data
 }
 
-struct Draft: Identifiable {
-    let id = UUID()
+struct Draft: Identifiable, Codable {
+    var id = UUID()
     var account: UUID
     var to = ""
     var cc = ""
@@ -71,6 +72,15 @@ struct Draft: Identifiable {
     var files: [DraftFile] = []
     var sending = false
     var error: String?
+}
+
+enum PreparedState: String, Codable { case ready, sending, sent, discarded }
+
+/// A draft Claude wrote that waits for the user to review and send it.
+struct Prepared: Codable, Identifiable {
+    var draft: Draft
+    var state: PreparedState = .ready
+    var id: UUID { draft.id }
 }
 
 @Observable @MainActor
@@ -98,6 +108,11 @@ final class MailStore {
     var focusSearch = false
     var dropTarget: Role?
     var showClaude = false
+    var prepared: [Prepared] = []
+    @ObservationIgnored var chatFrame: CGRect = .zero
+    @ObservationIgnored let demo = ProcessInfo.processInfo.environment["EMAIL_DEMO"] != nil
+    /// folders that have been fetched at least once since launch (later refreshes merge instead of replace)
+    @ObservationIgnored private var refreshed: Set<String> = []
     var rowSwipe: (id: String, dx: CGFloat)?
     @ObservationIgnored var hoverID: String?
     @ObservationIgnored var listMinX: CGFloat = 0
@@ -109,7 +124,11 @@ final class MailStore {
     @ObservationIgnored private var timer: Timer?
 
     init() {
-        if ProcessInfo.processInfo.environment["EMAIL_DEMO"] != nil { loadDemo(); return }
+        if demo { loadDemo(); return }
+        if let d = try? Data(contentsOf: Paths.prepared), var p = try? JSONDecoder().decode([Prepared].self, from: d) {
+            for i in p.indices where p[i].state == .sending { p[i].state = .ready }
+            prepared = p
+        }
         if let d = try? Data(contentsOf: Paths.accounts), let a = try? JSONDecoder().decode([Account].self, from: d) {
             accounts = a
         }
@@ -267,7 +286,16 @@ final class MailStore {
             errors[a.id] = nil
             let old = Dictionary((lists[k] ?? []).map { ($0.uid, $0) }, uniquingKeysWith: { a, _ in a })
             var mails = fetched.map { makeMail($0, account: a.id, folder: folder, role: r, snippet: old[$0.uid]?.snippet.map(decodeNumericEntities)) }
-            if more { mails = (lists[k] ?? []) + mails.filter { old[$0.uid] == nil } }
+            // an email that was just archived/deleted here is still on the server for a few seconds — keep it hidden
+            mails.removeAll { pending[$0.id] != nil }
+            if more {
+                mails = (lists[k] ?? []) + mails.filter { old[$0.uid] == nil }
+            } else if !virtualStar, refreshed.contains(k), let floor = fetched.map(\.uid).min() {
+                // a refresh only looks at the newest 50; keep the older ones already loaded ("load older")
+                // so the list doesn't shrink and an older email being read doesn't close by itself
+                mails += (lists[k] ?? []).filter { $0.uid < floor }
+            }
+            refreshed.insert(k)
             mails.sort { $0.date > $1.date }
             lists[k] = mails
             if let d = try? JSONEncoder().encode(Array(mails.prefix(150))) { try? d.write(to: Paths.list(a.id, r)) }
@@ -297,11 +325,14 @@ final class MailStore {
         guard !todo.isEmpty else { return }
         todo.forEach { prefetching.insert($0.id) }
         Task {
+            var batch: [(String, String)] = []
             for m in todo {
                 guard let raw = try? await rawBody(m, conn: conn) else { continue }
-                let parsed = parseMessage(raw)
-                update(m.id) { $0.snippet = snippet(of: parsed) }
+                batch.append((m.id, snippet(of: parseMessage(raw))))
+                // publish every few messages, not once per message (each publish redraws the list)
+                if batch.count == 8 { applySnippets(batch); batch.removeAll() }
             }
+            applySnippets(batch)
         }
     }
 
@@ -311,6 +342,18 @@ final class MailStore {
         let raw = try await conn.run { try $0.fetchBody(m.folder, uid: m.uid) }
         try? Data(raw).write(to: url)
         return raw
+    }
+
+    /// One pass over the lists for a whole batch of previews.
+    private func applySnippets(_ batch: [(String, String)]) {
+        guard !batch.isEmpty else { return }
+        let text = Dictionary(batch, uniquingKeysWith: { $1 })
+        for (k, l) in lists where l.contains(where: { text[$0.id] != nil }) {
+            lists[k] = l.map { m in
+                guard let s = text[m.id], m.snippet != s else { return m }
+                var c = m; c.snippet = s; return c
+            }
+        }
     }
 
     private func update(_ id: String, _ f: (inout Mail) -> Void) {
@@ -457,9 +500,19 @@ final class MailStore {
             if case .send(let id) = item {
                 guard let p = pendingSends.removeValue(forKey: id) else { continue }
                 p.task.cancel()
+                closeDraft(quiet: true)
+                setPrepared(id, .ready)
                 withAnimation(.smooth) {
                     toast = nil
                     draft = p.draft
+                }
+                return
+            }
+            if case .closed(let d) = item {
+                guard draft == nil else { continue }
+                withAnimation(.smooth) {
+                    toast = nil
+                    draft = d
                 }
                 return
             }
@@ -507,6 +560,7 @@ final class MailStore {
 
     func compose() {
         guard let id = defaultAccount else { showAddAccount = true; return }
+        closeDraft(quiet: true)
         draft = Draft(account: id)
     }
 
@@ -532,21 +586,36 @@ final class MailStore {
             d.inReplyTo = m.messageID
             d.references = [m.references, m.messageID].compactMap { $0 }.joined(separator: " ")
         }
+        closeDraft(quiet: true)
         draft = d
+    }
+
+    private func problem(with d: Draft) -> String? {
+        guard account(d.account) != nil else { return "that account isn't connected any more — pick another one" }
+        let to = parseAddresses(d.to)
+        guard !to.isEmpty, to.allSatisfy({ $0.email.contains("@") }), parseAddresses(d.cc).allSatisfy({ $0.email.contains("@") }) else {
+            return "add someone to send to"
+        }
+        return nil
     }
 
     /// Closes the composer right away; the email actually goes out after `undoWindow` seconds unless undone.
     func send() {
-        guard var d = draft, account(d.account) != nil, !d.sending else { return }
-        let to = parseAddresses(d.to)
-        guard !to.isEmpty, to.allSatisfy({ $0.email.contains("@") }), parseAddresses(d.cc).allSatisfy({ $0.email.contains("@") }) else {
-            draft?.error = "add someone to send to"
-            return
-        }
+        guard let d = draft, !d.sending else { return }
+        if let p = problem(with: d) { draft?.error = p; return }
+        withAnimation(.smooth) { draft = nil }
+        queueSend(d)
+    }
+
+    private func queueSend(_ d0: Draft) {
+        var d = d0
         d.error = nil
         d.sending = false
         let id = d.id
-        withAnimation(.smooth) { draft = nil }
+        if prepared(id) != nil {
+            updatePrepared(d)
+            setPrepared(id, .sending)
+        }
         let task = Task { [weak self] in
             try? await Task.sleep(for: .seconds(Self.undoWindow))
             guard !Task.isCancelled, let self, let p = self.pendingSends.removeValue(forKey: id) else { return }
@@ -555,6 +624,111 @@ final class MailStore {
         pendingSends[id] = (d, task)
         undoStack.append(.send(id))
         flash("sending…", undo: true)
+    }
+
+    /// Closes the composer without losing the text: Claude's drafts go back to their card, anything else can be undone (⌘Z).
+    func closeDraft(quiet: Bool = false) {
+        guard let d = draft else { return }
+        withAnimation(.smooth) { draft = nil }
+        if prepared(d.id) != nil { updatePrepared(d); return }
+        let typed = [d.to, d.cc, d.subject, d.body].contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } || !d.files.isEmpty
+        guard typed else { return }
+        undoStack.append(.closed(d))
+        if !quiet { flash("draft closed", undo: true) }
+    }
+
+    // MARK: drafts from claude
+
+    func prepared(_ id: UUID) -> Prepared? { prepared.first { $0.id == id } }
+
+    func addPrepared(_ d: Draft) {
+        prepared.append(Prepared(draft: d))
+        savePrepared()
+    }
+
+    func updatePrepared(_ d: Draft) {
+        guard let i = prepared.firstIndex(where: { $0.id == d.id }) else { return }
+        prepared[i].draft = d
+        if draft?.id == d.id { draft = d }
+        savePrepared()
+    }
+
+    func setPrepared(_ id: UUID, _ state: PreparedState) {
+        guard let i = prepared.firstIndex(where: { $0.id == id }) else { return }
+        prepared[i].state = state
+        if state == .sent || state == .discarded {
+            // keep the names for the card, drop the bytes
+            for k in prepared[i].draft.files.indices { prepared[i].draft.files[k].data = Data() }
+            if draft?.id == id { withAnimation(.smooth) { draft = nil } }
+        }
+        savePrepared()
+    }
+
+    func review(_ id: UUID) {
+        guard let p = prepared(id), p.state == .ready else { return }
+        if draft?.id != id { closeDraft(quiet: true) }
+        withAnimation(.smooth) { draft = p.draft }
+    }
+
+    func sendPrepared(_ id: UUID) {
+        guard let p = prepared(id), p.state == .ready else { return }
+        if let why = problem(with: p.draft) { flash(why); return }
+        queueSend(p.draft)
+    }
+
+    func clearPrepared() {
+        prepared.removeAll { $0.state != .sending }
+        savePrepared()
+    }
+
+    private func savePrepared() {
+        guard !demo else { return }
+        if prepared.count > 60 { prepared.removeFirst(prepared.count - 60) }
+        if let d = try? JSONEncoder().encode(prepared) { try? d.write(to: Paths.prepared, options: .atomic) }
+    }
+
+    // MARK: lookups for claude
+
+    func resolveAccount(_ s: String) -> Account? {
+        let q = s.trimmingCharacters(in: .whitespaces).lowercased()
+        let email = parseAddresses(q).first?.email ?? q
+        return accounts.first { $0.email.lowercased() == email } ?? accounts.first { $0.label.lowercased() == q }
+    }
+
+    func parseID(_ id: String) -> (UUID, String, UInt32)? {
+        guard let a = id.firstIndex(of: "|"), let b = id.lastIndex(of: "|"), a < b,
+              let acc = UUID(uuidString: String(id[..<a])), let uid = UInt32(id[id.index(after: b)...]) else { return nil }
+        return (acc, String(id[id.index(after: a)..<b]), uid)
+    }
+
+    /// The whole message for an id, from the cache or the server.
+    func fullMessage(_ id: String) async throws -> ParsedMail {
+        guard let (acc, folder, uid) = parseID(id), account(acc) != nil else { throw NetError.server("there's no email with that id") }
+        if demo {
+            var p = ParsedMail()
+            p.text = rendered[id]?.plain
+            return p
+        }
+        guard let conn = main[acc] else { throw NetError.server("that account isn't connected") }
+        let url = Paths.body(acc, folder, uid)
+        if let d = try? Data(contentsOf: url) { return parseMessage(Array(d)) }
+        let raw = try await conn.run { try $0.fetchBody(folder, uid: uid) }
+        try? Data(raw).write(to: url)
+        return parseMessage(raw)
+    }
+
+    /// Searches the whole mailbox on the server (gmail search syntax on gmail accounts).
+    func searchServer(_ a: Account, _ query: String, limit: Int) async throws -> [Mail] {
+        if demo {
+            let q = query.lowercased()
+            return (lists[key(a.id, .inbox)] ?? []).filter { "\($0.subject) \($0.from.formatted) \($0.snippet ?? "")".lowercased().contains(q) }
+        }
+        guard let conn = main[a.id] else { return [] }
+        let gmail = a.isGmail
+        let role: Role = gmail && a.folder(.archive) != nil ? .archive : .inbox
+        let folder = a.folder(role) ?? "INBOX"
+        let fetched = try await conn.run { try $0.search(folder, query: query, gmail: gmail, limit: limit) }
+        return fetched.map { makeMail($0, account: a.id, folder: folder, role: role, snippet: nil) }.sorted { $0.date > $1.date }
     }
 
     private func deliver(_ d: Draft) async {
@@ -572,13 +746,16 @@ final class MailStore {
             if !a.isGmail && !a.imapHost.contains("office365"), let sent = a.folder(.sent) {
                 try? await conn?.run { try $0.append(sent, message: msg) }
             }
+            setPrepared(d.id, .sent)
             flash("sent")
             if role == .sent { await load(a, .sent) }
         } catch {
             // never lose a message: bring the draft back with the reason
             var back = d
             back.error = error.localizedDescription
+            setPrepared(d.id, .ready)
             if draft == nil { withAnimation(.smooth) { draft = back } }
+            else { undoStack.append(.closed(back)) }
             flash("couldn't send — draft reopened")
         }
     }

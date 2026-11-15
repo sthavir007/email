@@ -158,6 +158,7 @@ final class Connection: @unchecked Sendable {
     private var account: Account
     private let queue: DispatchQueue
     private var client: IMAPClient?
+    private var lastUsed = Date.distantPast
 
     init(_ account: Account, label: String) {
         self.account = account
@@ -175,10 +176,16 @@ final class Connection: @unchecked Sendable {
     private func withClient<T>(_ f: (IMAPClient) throws -> T) throws -> T {
         for attempt in 0..<2 {
             do {
+                // after a quiet spell (sleep, wifi change) check the line first; a dead one is replaced at once
+                if let c = client, Date().timeIntervalSince(lastUsed) > 90 {
+                    do { try c.noop(timeout: 6) } catch { client = nil }
+                }
                 if client == nil {
                     client = try IMAPClient(host: account.imapHost, port: account.imapPort, user: account.username, credential: TokenCache.credential(for: account))
                 }
-                return try f(client!)
+                let out = try f(client!)
+                lastUsed = Date()
+                return out
             } catch let e as NetError where e.isTransport && attempt == 0 {
                 client = nil
             } catch let e as NetError where e.isTransport {
@@ -209,7 +216,9 @@ final class Connection: @unchecked Sendable {
 
 enum Paths {
     static let support: URL = {
-        let u = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("email")
+        // demo runs keep their chat and drafts apart from the real ones
+        let demo = ProcessInfo.processInfo.environment["EMAIL_DEMO"] != nil
+        let u = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent(demo ? "email-demo" : "email")
         try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
         return u
     }()
@@ -220,6 +229,8 @@ enum Paths {
     }()
     static var accounts: URL { support.appendingPathComponent("accounts.json") }
     static var chat: URL { support.appendingPathComponent("claude-chat.json") }
+    static var prepared: URL { support.appendingPathComponent("claude-drafts.json") }
+    static var mcpConfig: URL { support.appendingPathComponent("claude-tools.json") }
 
     static func list(_ account: UUID, _ role: Role) -> URL { cache.appendingPathComponent("\(account.uuidString)-\(role.rawValue).json") }
     static func body(_ account: UUID, _ folder: String, _ uid: UInt32) -> URL {

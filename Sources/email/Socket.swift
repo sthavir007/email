@@ -32,7 +32,13 @@ final class LineSocket {
     var timeout: TimeInterval = 30
 
     init(host: String, port: Int, tls: Bool) throws {
-        let params: NWParameters = tls ? NWParameters(tls: NWProtocolTLS.Options(), tcp: NWProtocolTCP.Options()) : .tcp
+        // keepalive notices a connection that died while the Mac slept
+        let tcp = NWProtocolTCP.Options()
+        tcp.enableKeepalive = true
+        tcp.keepaliveIdle = 30
+        tcp.keepaliveInterval = 10
+        tcp.keepaliveCount = 3
+        let params = NWParameters(tls: tls ? NWProtocolTLS.Options() : nil, tcp: tcp)
         conn = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(integerLiteral: UInt16(port)), using: params)
         let sem = DispatchSemaphore(value: 0)
         var err: Error?

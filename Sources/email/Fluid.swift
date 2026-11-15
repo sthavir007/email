@@ -139,17 +139,57 @@ final class Fluid {
     }
 }
 
+/// The one switch for every animated view. On only while this app is frontmost and a window is actually visible.
+/// (`appearsActive` + TimelineView's `paused:` did NOT stop the timelines once the app had been focused and left —
+/// it kept redrawing in the background at ~25% CPU — so paused views drop their TimelineView entirely.)
+@MainActor @Observable
+final class Motion {
+    static let shared = Motion()
+    private static let demo = ProcessInfo.processInfo.environment["EMAIL_DEMO"] != nil
+    private(set) var on = true
+    /// the moment the animation stopped, so the frozen frame is the last one shown
+    private(set) var frozenAt = Fluid.now
+
+    private init() {
+        let nc = NotificationCenter.default
+        for name in [NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification,
+                     NSApplication.didChangeOcclusionStateNotification, NSApplication.didHideNotification,
+                     NSApplication.didUnhideNotification] {
+            nc.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { Motion.shared.refresh() }
+            }
+        }
+        refresh()
+    }
+
+    func refresh() {
+        let app = NSApplication.shared
+        let want = Self.demo || (app.isActive && !app.isHidden && app.occlusionState.contains(.visible))
+        guard want != on else { return }
+        if !want { frozenAt = Fluid.now }
+        on = want
+    }
+}
+
 struct FluidBackground: View {
     var fluid: Fluid = .shared
-    @Environment(\.appearsActive) private var active
-    private static let demo = ProcessInfo.processInfo.environment["EMAIL_DEMO"] != nil
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 60, paused: !active && !Self.demo)) { tl in
-            let (pts, cols) = fluid.frame(tl.date.timeIntervalSinceReferenceDate)
-            MeshGradient(width: 5, height: 5, points: pts, colors: cols, smoothsColors: true, colorSpace: .perceptual)
+        Group {
+            if Motion.shared.on {
+                TimelineView(.animation(minimumInterval: 1 / 20)) { tl in
+                    mesh(tl.date.timeIntervalSinceReferenceDate)
+                }
+            } else {
+                mesh(Motion.shared.frozenAt)
+            }
         }
         .ignoresSafeArea()
+    }
+
+    private func mesh(_ t: Double) -> some View {
+        let (pts, cols) = fluid.frame(t)
+        return MeshGradient(width: 5, height: 5, points: pts, colors: cols, smoothsColors: true, colorSpace: .perceptual)
     }
 }
 
@@ -159,8 +199,19 @@ struct LogoMark: View {
     var size: CGFloat = 28
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 30)) { tl in
-            let t = tl.date.timeIntervalSinceReferenceDate
+        Group {
+            if Motion.shared.on {
+                TimelineView(.animation(minimumInterval: 1 / 10)) { tl in mesh(tl.date.timeIntervalSinceReferenceDate) }
+            } else {
+                mesh(Motion.shared.frozenAt)
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: size * 0.3, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: size * 0.3, style: .continuous).strokeBorder(.white.opacity(0.22), lineWidth: max(0.5, size * 0.02)))
+    }
+
+    private func mesh(_ t: Double) -> some View {
             let pts: [SIMD2<Float>] = [
                 [0, 0], [0.5, 0], [1, 0],
                 [0, 0.5], [Float(0.5 + 0.18 * sin(t * 0.9)), Float(0.5 + 0.18 * cos(t * 0.7))], [1, 0.5],
@@ -170,11 +221,7 @@ struct LogoMark: View {
             let cols: [Color] = [.black, Color(white: 0.1), Color(white: 0.55 * w),
                                  Color(white: 0.08), .white, Color(white: 0.15),
                                  Color(white: 0.5 * (1 - w)), Color(white: 0.06), .black]
-            MeshGradient(width: 3, height: 3, points: pts, colors: cols, smoothsColors: true)
-        }
-        .frame(width: size, height: size)
-        .clipShape(RoundedRectangle(cornerRadius: size * 0.3, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: size * 0.3, style: .continuous).strokeBorder(.white.opacity(0.22), lineWidth: max(0.5, size * 0.02)))
+        return MeshGradient(width: 3, height: 3, points: pts, colors: cols, smoothsColors: true)
     }
 }
 
